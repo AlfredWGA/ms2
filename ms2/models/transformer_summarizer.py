@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from transformers import BartForConditionalGeneration, AutoConfig
 from transformers.file_utils import ModelOutput
-from transformers.modeling_bart import _prepare_bart_decoder_inputs
+from transformers.modeling_bart import _prepare_bart_decoder_inputs, Attention
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.optimization import get_linear_schedule_with_warmup
 
@@ -51,6 +51,8 @@ class ReferenceInteractingBartSummarizer(nn.Module):
         self.model.resize_token_embeddings(len(tokenizer.get_vocab()))
         self.tokenizer = tokenizer
         self.config = self.model.config
+        self.fc = nn.Linear(self.config.d_model, 1)
+        self.self_attn = Attention(self.config.d_model, 1, dropout=config.attention_dropout)
         self.args = args
 
     def _encode_multiple(
@@ -62,12 +64,14 @@ class ReferenceInteractingBartSummarizer(nn.Module):
             return_dict=False
         ):
         """
-        inputs: Padded reference texts
-        preamble: single beginning/prompt
+        inputs: Padded reference texts, [num_ref, len]
+        preamble: single beginning/prompt, [1, len]
         """
         inputs = inputs[:self.args.max_num_refs]
+        # print(self.tokenizer.decode(inputs[0][0]))
+        # assert self.tokenizer.decode(inputs[0][0]) == "<cls>"
         preamble = preamble.repeat(inputs.size()[0], 1)
-        encoder_input = torch.cat([preamble, inputs], dim=1)[:, :self.config.max_position_embeddings]
+        encoder_input = torch.cat([preamble, inputs], dim=1)[:, :self.config.max_position_embeddings]   # Size [num_ref, max_len]
         encoder_outputs = self.model.model.encoder(
             encoder_input,
             output_attentions=output_attentions,
@@ -76,14 +80,29 @@ class ReferenceInteractingBartSummarizer(nn.Module):
             return_dict=False
         )
         selection_mask = encoder_input != self.config.pad_token_id
+        # Extract the input tokens using mask
         input_ids = torch.masked_select(encoder_input, selection_mask).unsqueeze(0)
         if len(encoder_outputs) == 1:
-            encoded = encoder_outputs[0]
+            encoded = encoder_outputs[0]    # Size [num_ref, max_len, d_model]
             encoder_states, all_attentions = None, None
         else:
             encoded, encoder_states, all_attentions = encoder_outputs
             encoder_states = tuple(torch.masked_select(hs, selection_mask) for hs in encoder_states)
             all_attentions = tuple(torch.masked_select(attn, selection_mask) for attn in all_attentions)
+        # TODO: (Guoao) Apply self-attention and weighting before masked select
+        cls_feature = encoded[:, 0, :].reshape(-1, encoded.size()[-1])  # Shape [num_ref, d_model]
+        # Reshape into [seq_len, batch, embed_dim] as required by Attention
+        cls_feature = torch.unsqueeze(cls_feature, 1)
+
+        cls_feature, _ = self.self_attn(
+            query=cls_feature, key=cls_feature
+        )
+                
+        # [num_ref, 1, 1]
+        cls_weights = F.sigmoid(self.fc(cls_feature))
+
+        encoded = cls_weights * encoded
+
         encoded_sequences = torch.masked_select(encoded, selection_mask.unsqueeze(-1)).reshape(1, -1, encoded.size()[-1])
         if torch.any(torch.isnan(encoded)):
             raise RuntimeError('Found nans while encoding inputs!')
@@ -426,11 +445,17 @@ class LightningBartSummarizer(LightningModule):
         self.save_hyperparameters()
         self.args = args
         self.tokenizer = get_tokenizer('facebook/bart-base')
+
+        # Add a cls token and its embedding
+        self.tokenizer.add_special_tokens({"cls_token": "<cls>"})
+        # No need to resize embedding 'cause it's already done in ReferenceInteractingBartSummarizer
+        # self.summarizer.model.resize_token_embeddings(len(self.tokenizer))
+
         if 'long' in args.model_name:
             self.summarizer = SingleStreamBartSummarizer(args.model_name, self.tokenizer, args)
         else:
             self.summarizer = ReferenceInteractingBartSummarizer(args.model_name, self.tokenizer, args)
-
+        
         self.config = self.summarizer.config
         self.generation_params = {
             'num_beams': args.num_beams,
