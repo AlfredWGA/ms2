@@ -99,17 +99,26 @@ def process_reference(reference: Reference) -> Optional[TargetReference]:
     )
 
 def process_review(review: Review, max_refs: int, tokenizer) -> Tuple[Optional[TargetSummary], Set[str]]:
+    """
+    The place where reviews are processed
+    """
+    # The input text
     input_text = None
+    # The target texts that we want to generate
     target_texts = []
     summaries = []
+    # If the review contains the abstract
     if review.structured_abstract is not None and len(review.structured_abstract) > 1:
+        # Extract the preamble and target from the abstract
         abs_preamble, abs_target, abs_unknown_fields = extract_summary_parts(review.structured_abstract)
         if len(abs_preamble.strip()) == 0:
             return None
         abs_preamble = START_BACKGROUND + ' ' + abs_preamble + ' ' + END_BACKGROUND
     else:
         abs_preamble, abs_target, abs_unknown_fields = None, None, []
+    # If the review contains the summary
     if review.structured_summary is not None and len(review.structured_summary) > 1:
+        # Extract the preamble and target from the abstract
         sum_preamble, sum_target, sum_unknown_fields = extract_summary_parts(review.structured_summary)
         sum_preamble = START_BACKGROUND + ' ' + sum_preamble + ' ' + END_BACKGROUND
     else:
@@ -121,12 +130,14 @@ def process_review(review: Review, max_refs: int, tokenizer) -> Tuple[Optional[T
 
     if abs_target is None and sum_target is None:
         return None, unknown_fields
-
+    
+    # Add the target text from abstract and summary if exists
     if abs_target is not None and len(abs_target) > 0:
         target_texts.append(abs_target)
     if sum_target is not None and len(sum_target) > 0:
         target_texts.append(sum_target)
 
+    # Use the preamble from abstract; it doesn't exist, use the one in summary
     if abs_preamble is not None:
         input_text = abs_preamble
     elif sum_preamble is not None:
@@ -137,10 +148,12 @@ def process_review(review: Review, max_refs: int, tokenizer) -> Tuple[Optional[T
     if len(input_text.strip()) == 0:
         return None, set()
 
+    # Get the abstract of all reference studies and process
     selected_study_references = map(select_reference_from_study, review.included_studies)
     processed_references = map(process_reference, selected_study_references)
     references = list(filter(lambda x: x is not None, processed_references))
 
+    # Limit the number of reference each review
     if max_refs is not None and len(references) > max_refs:
         logging.info('Truncating review {} references from {} to {}'.format(review.docid, len(references), max_refs))
         references = references[:max_refs]
@@ -172,6 +185,9 @@ def clean_targets(target_texts: List[str]) -> List[str]:
     return cleaned_targets
 
 def tokenize_target_summary(summary: TargetSummary, tokenizer, max_length: Optional[int]) -> TargetSummary:
+    """
+    Tokenize the bachground, target sentences and reference studies of each example.
+    """
     end_reference = tokenizer.encode(END_REFERENCE, add_special_tokens=False)[0]
     def tokenize_target_reference(target_reference: TargetReference) -> TargetReference:
         title_abstract = tokenizer.encode(
@@ -190,18 +206,24 @@ def tokenize_target_summary(summary: TargetSummary, tokenizer, max_length: Optio
                 truncation=max_length is not None, max_length=max_length
             ) if target_reference.full_text is not None else None,
         )
-    
-    end_background = tokenizer.encode(END_BACKGROUND, add_special_tokens=False)[0]
+
+    # Encode the review's background (input 1)
+    end_background = tokenizer.encode(END_BACKGROUND, add_special_tokens=False)[0]  
+    # TODO: (Guoao) Add the CLS token here
+    tokenizer.add_special_tokens({"cls_token": "<cls>"})   # Set a new CLS token
+    cls_token = tokenizer.encode(tokenizer.cls_token, add_special_tokens=False)[0]
     if len(summary.preface) > 0:
         preface = tokenizer.encode(summary.preface,
                                    truncation=max_length is not None,
                                    max_length=max_length,
                                    add_special_tokens=False)
+        preface = [cls_token] + preface
         if preface[-1] != end_background:
             preface = preface + [end_background]
     else:
         preface = None
-
+    
+    # Encode the target sentences (outputs)
     target_texts = []
     eos_token = tokenizer.encode(tokenizer._eos_token.content, add_special_tokens=False)[0]
     for target_text in summary.target_texts:
@@ -219,7 +241,7 @@ def tokenize_target_summary(summary: TargetSummary, tokenizer, max_length: Optio
     return replace(summary,
         preface=preface,
         target_texts=target_texts,
-        references=list(map(tokenize_target_reference, summary.references)),
+        references=list(map(tokenize_target_reference, summary.references)),    # Encode the reference studies (input 2)
     )
 
 def valid_review(summary: TargetSummary) -> bool:
