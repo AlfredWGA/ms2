@@ -51,8 +51,11 @@ class ReferenceInteractingBartSummarizer(nn.Module):
         self.model.resize_token_embeddings(len(tokenizer.get_vocab()))
         self.tokenizer = tokenizer
         self.config = self.model.config
-        self.fc = nn.Linear(self.config.d_model, 1)
-        self.self_attn = Attention(self.config.d_model, 1, dropout=config.attention_dropout)
+
+        self.fc = nn.Linear(self.config.d_model, 1) # FC layer to produce the cls weights
+        self.self_attn = Attention(self.config.d_model, 1, dropout=config.attention_dropout)    # Self attention over all cls features
+        self.cls_weight = None 
+
         self.args = args
 
     def _encode_multiple(
@@ -98,10 +101,11 @@ class ReferenceInteractingBartSummarizer(nn.Module):
             query=cls_feature, key=cls_feature
         )
                 
-        # [num_ref, 1, 1]
-        cls_weights = F.sigmoid(self.fc(cls_feature))
+        # Weights for each CLS feature [num_ref, 1, 1]
+        # self.cls_weights.weight.data = F.sigmoid(self.fc(cls_feature))
+        self.cls_weight = F.sigmoid(self.fc(cls_feature))
 
-        encoded = cls_weights * encoded
+        encoded = self.cls_weight * encoded
 
         encoded_sequences = torch.masked_select(encoded, selection_mask.unsqueeze(-1)).reshape(1, -1, encoded.size()[-1])
         if torch.any(torch.isnan(encoded)):
@@ -469,6 +473,8 @@ class LightningBartSummarizer(LightningModule):
             'repetition_penalty': args.repetition_penalty,
         }
         self.predictions_file = None
+        self.train_cls_weights_file = None
+        self.val_cls_weights_file = None
 
     def forward(self, inputs, preambles, targets):
         return self.summarizer.forward(inputs=inputs, preambles=preambles, targets=targets)
@@ -485,6 +491,14 @@ class LightningBartSummarizer(LightningModule):
     def training_step(self, batch, batch_idx):
         outputs = self.forward(*batch)
         loss = outputs[0]
+        
+        if not self.train_cls_weights_file:
+            self.train_cls_weights_file = open(os.path.join(self.args.training_root, 'training_cls_weights.csv'), 'w')
+        
+        cls_weight = self.summarizer.cls_weight.detach().cpu().reshape([-1]).numpy() # Each cls_weight [num_ref]
+        self.train_cls_weights_file.write(','.join([str(x) for x in cls_weight]) + '\n')
+        self.train_cls_weights_file.flush()
+
         output = {
             'loss': loss,
             'train_loss': loss,
@@ -494,6 +508,17 @@ class LightningBartSummarizer(LightningModule):
             },
         }
         return output
+    
+    def training_epoch_end(self, training_step_outputs):
+        self.train_cls_weights_file.close()
+        self.train_cls_weights_file = None
+
+        train_loss = np.mean([output['train_loss'].detach().cpu().numpy() for output in training_step_outputs])
+        output = {
+            'loss': train_loss
+        }
+
+        return output    # Must return a dict for older version of pt lighting
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
@@ -510,6 +535,13 @@ class LightningBartSummarizer(LightningModule):
             **self.generation_params,
         )
         targets = batch[2]
+        
+        if not self.val_cls_weights_file:
+            self.val_cls_weights_file = open(os.path.join(self.args.training_root, 'validation_cls_weights.csv'), 'w')
+        cls_weight = self.summarizer.cls_weight.detach().cpu().reshape([-1]).numpy() # Each cls_weight [num_ref]
+        self.val_cls_weights_file.write(','.join([str(x) for x in cls_weight]) + '\n')
+        self.val_cls_weights_file.flush()
+
         output = {
             'val_loss': loss.cpu(),
             'progress_bar': {
@@ -525,6 +557,10 @@ class LightningBartSummarizer(LightningModule):
         return output
 
     def validation_epoch_end(self, outputs):
+        # TODO: (Guoao) Save cls weights as file
+        self.val_cls_weights_file.close()
+        self.val_cls_weights_file = None
+
         losses = np.mean([output['val_loss'] for output in outputs])
         generated, teacher_forced_generations, targets = self._accumulate_generations(outputs)
         assert len(generated) > 0
